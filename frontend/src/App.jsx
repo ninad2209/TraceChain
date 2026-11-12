@@ -1,209 +1,362 @@
-import React, { useState } from 'react';
-import axios from 'axios';
-import { Shield, AlertTriangle, Activity, Server, RefreshCw, Search, Network, Flame } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
 import GraphProcessing from './GraphProcessing';
+import DetailModal from './DetailModal';
+import IncidentPanel from './IncidentPanel';
+
+const API = 'http://127.0.0.1:8000/api/v1';
+
+const NAV = [
+  { label: 'Dashboard', icon: '📊' },
+  { label: 'Threat Graph', icon: '🕸️' },
+  { label: 'Process Analytics', icon: '🔎' },
+  { label: 'Rule Engine', icon: '📜' },
+  { label: 'Alert Logs', icon: '🚨' },
+  { label: 'Settings', icon: '⚙️' }
+];
+
+const Pill = ({ level, children }) => (
+  <span className={`pill pill-${String(level).toLowerCase()}`}>{children || level}</span>
+);
 
 export default function App() {
-  const [loading, setLoading] = useState(false);
-  const [telemetryData, setTelemetryData] = useState(null);
-  const [searchTerm, setSearchTerm] = useState('');
-  const [activeTab, setActiveTab] = useState('table'); // 'table' or 'graph'
+  const [activeTab, setActiveTab] = useState('Dashboard');
+  const [scanData, setScanData] = useState(null);
   const [isSimulated, setIsSimulated] = useState(false);
-  const [error, setError] = useState(null);
+  const [selectedProc, setSelectedProc] = useState(null);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [filter, setFilter] = useState('ALL');
+  const [rules, setRules] = useState([]);
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [toast, setToast] = useState('');
+  const [autoRefresh, setAutoRefresh] = useState(false);
+  const [backendDown, setBackendDown] = useState(false);
+  const [lastScan, setLastScan] = useState('');
+  const toastTimer = useRef(null);
 
-  const runLiveScan = async () => {
-    setIsSimulated(false);
-    setLoading(true);
-    setError(null);
+  const showToast = (msg) => {
+    setToast(msg);
+    clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(''), 3000);
+  };
+
+  const stamp = () => setLastScan(new Date().toLocaleTimeString([], { hour12: false }));
+
+  // Load live (or simulated) results WITHOUT resetting isolation state
+  const loadScan = async (simulate = false) => {
     try {
-      const response = await axios.get('http://127.0.0.1:8000/api/v1/scan');
-      setTelemetryData(response.data);
+      const res = await fetch(`${API}/scan?simulate=${simulate}`);
+      const data = await res.json();
+      setScanData(data);
+      setIsSimulated(simulate);
+      setRefreshKey((k) => k + 1);
+      setBackendDown(false);
+      stamp();
     } catch (err) {
-      setError("Failed to connect to TraceChain Engine at http://127.0.0.1:8000");
-    } finally {
-      setLoading(false);
+      console.error('Scan failed', err);
+      setBackendDown(true);
     }
   };
 
-  const runThreatSimulation = async () => {
-    setIsSimulated(true);
-    setLoading(true);
-    setError(null);
+  // Fresh simulated attack (clears earlier isolation of the mock PIDs)
+  const startSimulation = async () => {
     try {
-      const response = await axios.get('http://127.0.0.1:8000/api/v1/simulate-threat');
-      setTelemetryData(response.data);
+      const res = await fetch(`${API}/simulate-threat`, { method: 'POST' });
+      const data = await res.json();
+      setScanData(data);
+      setIsSimulated(true);
+      setRefreshKey((k) => k + 1);
+      setBackendDown(false);
+      setActiveTab('Dashboard');
+      stamp();
+      showToast('Simulated attack loaded');
     } catch (err) {
-      setError("Failed to execute threat simulation.");
-    } finally {
-      setLoading(false);
+      console.error('Simulation failed', err);
+      setBackendDown(true);
     }
   };
 
-  const filteredProcesses = telemetryData?.results?.filter(proc => 
-    proc.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-    proc.pid.toString().includes(searchTerm)
-  ) || [];
+  useEffect(() => {
+    loadScan(false);
+    fetch(`${API}/rules`).then((r) => r.json()).then(setRules).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (!autoRefresh || isSimulated) return undefined;
+    const id = setInterval(() => loadScan(false), 3000);
+    return () => clearInterval(id);
+  }, [autoRefresh, isSimulated]);
+
+  const isolateProc = async (proc) => {
+    try {
+      await fetch(`${API}/isolate-process/${proc.pid}?create_time=${encodeURIComponent(proc.create_time || '')}`, {
+        method: 'POST'
+      });
+      showToast(`${proc.name} (PID ${proc.pid}) marked as isolated`);
+      setSelectedProc(null);
+      loadScan(isSimulated);
+    } catch (err) {
+      console.error('Isolation failed', err);
+      showToast('Isolation failed. Is the backend running?');
+    }
+  };
+
+  const results = scanData?.results || [];
+  const sortedResults = [...results].sort((a, b) => b.risk_score - a.risk_score);
+
+  const filteredResults = sortedResults.filter((proc) => {
+    const q = searchQuery.toLowerCase();
+    if (!(proc.name.toLowerCase().includes(q) || proc.pid.toString().includes(q))) return false;
+    if (filter === 'HIGH') return proc.threat_level === 'HIGH';
+    if (filter === 'NETWORK') return proc.tags?.includes('NETWORK_ACTIVE');
+    return true;
+  });
+
+  const live = results.filter((r) => !r.is_isolated);
+  const highCount = live.filter((r) => r.threat_level === 'HIGH').length;
+  const medCount = live.filter((r) => r.threat_level === 'MEDIUM').length;
+  const status = scanData?.system_status;
+
+  const kpis = [
+    { label: 'Processes analysed', value: scanData?.total_analyzed || 0, color: 'var(--accent)' },
+    { label: 'High risk', value: highCount, color: highCount ? 'var(--high)' : 'var(--ok)' },
+    { label: 'Medium risk', value: medCount, color: medCount ? 'var(--med)' : 'var(--ok)' },
+    { label: 'Detection rules', value: rules.length, color: 'var(--violet)' }
+  ];
+
+  const alertList = sortedResults.filter((r) => r.threat_level !== 'LOW');
 
   return (
-    <div style={{ backgroundColor: '#0f172a', color: '#f8fafc', minHeight: '100vh', fontFamily: 'system-ui, sans-serif' }}>
-      {/* Header Bar */}
-      <header style={{ borderBottom: '1px solid #1e293b', padding: '1rem 2rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-          <Shield style={{ color: '#38bdf8', width: '28px', height: '28px' }} />
-          <h1 style={{ fontSize: '1.25rem', fontWeight: 'bold', margin: 0 }}>TraceChain Security Telemetry</h1>
+    <div className="layout">
+      {/* SIDEBAR */}
+      <aside className="sidebar">
+        <div>
+          <h2 className="brand">Trace<span>Chain</span></h2>
+          <div className="brand-sub">Every attack leaves a chain</div>
         </div>
-        <div style={{ display: 'flex', gap: '0.75rem' }}>
-          <button 
-            onClick={runThreatSimulation}
-            disabled={loading}
-            style={{ 
-              backgroundColor: '#dc2626', color: '#ffffff', border: 'none', padding: '0.5rem 1rem', 
-              borderRadius: '0.375rem', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '0.5rem', fontWeight: '600' 
-            }}
-          >
-            <Flame style={{ width: '16px', height: '16px' }} />
-            Simulate Threat
-          </button>
-          <button 
-            onClick={runLiveScan} 
-            disabled={loading}
-            style={{ 
-              backgroundColor: '#0284c7', color: '#ffffff', border: 'none', padding: '0.5rem 1rem', 
-              borderRadius: '0.375rem', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '0.5rem', fontWeight: '600' 
-            }}
-          >
-            <RefreshCw style={{ width: '16px', height: '16px', animation: loading ? 'spin 1s linear infinite' : 'none' }} />
-            {loading ? 'Scanning Endpoint...' : 'Run Live Diagnostics'}
-          </button>
-        </div>
-      </header>
 
-      {/* Main Container */}
-      <main style={{ padding: '2rem', maxWidth: '1200px', margin: '0 auto' }}>
-        {error && (
-          <div style={{ backgroundColor: '#450a0a', border: '1px solid #991b1b', color: '#fca5a5', padding: '1rem', borderRadius: '0.5rem', marginBottom: '1.5rem', display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-            <AlertTriangle />
-            <span>{error}</span>
+        <nav style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          {NAV.map((item) => (
+            <div
+              key={item.label}
+              role="button"
+              tabIndex={0}
+              onClick={() => setActiveTab(item.label)}
+              onKeyDown={(e) => e.key === 'Enter' && setActiveTab(item.label)}
+              className={`sidebar-nav-item ${activeTab === item.label ? 'active' : ''}`}
+            >
+              <span>{item.icon}</span>
+              <span>{item.label}</span>
+            </div>
+          ))}
+        </nav>
+
+        <div style={{ marginTop: 'auto', paddingTop: 16, borderTop: '1px solid var(--line)' }}>
+          <button onClick={startSimulation} className="btn-sim btn-hover">⚡ Simulate Attack</button>
+          <div className="muted" style={{ fontSize: '0.7rem', marginTop: 8, textAlign: 'center' }}>
+            Safe demo with fake data. Nothing is executed.
+          </div>
+        </div>
+      </aside>
+
+      {/* MAIN */}
+      <main className="content">
+        <header className="topbar">
+          <div className="topbar-left">
+            <span className="page-title">{activeTab}</span>
+            <Pill level={status || 'low'}>{status || (backendDown ? 'OFFLINE' : 'LOADING')}</Pill>
+          </div>
+          <div className="topbar-right">
+            <span className="mode">
+              <span className={`live-dot ${isSimulated ? 'sim' : ''}`} />
+              {isSimulated ? 'Simulation' : 'Live system'}
+              {lastScan && <span className="mono"> · {lastScan}</span>}
+            </span>
+            <button onClick={() => loadScan(false)} className="btn">
+              {isSimulated ? 'Back to live system' : 'Rescan'}
+            </button>
+          </div>
+        </header>
+
+        {backendDown && (
+          <div className="banner">
+            Cannot reach the backend at 127.0.0.1:8000. Start it with: python -m uvicorn backend.main:app --reload
           </div>
         )}
 
-        {/* System Overview Metric Cards */}
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: '1.5rem', marginBottom: '2rem' }}>
-          <div style={{ backgroundColor: '#1e293b', padding: '1.25rem', borderRadius: '0.5rem', border: '1px solid #334155' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', color: '#94a3b8' }}>
-              <span>Total Processes</span>
-              <Activity style={{ width: '20px', height: '20px' }} />
+        {/* DASHBOARD */}
+        {activeTab === 'Dashboard' && (
+          <div className="page">
+            <div className="kpis">
+              {kpis.map((k) => (
+                <div className="kpi" key={k.label} style={{ borderTop: `3px solid ${k.color}` }}>
+                  <div className="kpi-label">{k.label}</div>
+                  <div className="kpi-value" style={{ color: k.color }}>{k.value}</div>
+                </div>
+              ))}
             </div>
-            <p style={{ fontSize: '2rem', fontWeight: 'bold', margin: '0.5rem 0 0 0' }}>
-              {telemetryData ? telemetryData.total_analyzed : '--'}
-            </p>
-          </div>
 
-          <div style={{ backgroundColor: '#1e293b', padding: '1.25rem', borderRadius: '0.5rem', border: '1px solid #334155' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', color: '#94a3b8' }}>
-              <span>High Threats</span>
-              <AlertTriangle style={{ width: '20px', height: '20px', color: telemetryData?.high_threat_count > 0 ? '#ef4444' : '#22c55e' }} />
-            </div>
-            <p style={{ fontSize: '2rem', fontWeight: 'bold', margin: '0.5rem 0 0 0', color: telemetryData?.high_threat_count > 0 ? '#ef4444' : '#f8fafc' }}>
-              {telemetryData ? telemetryData.high_threat_count : '--'}
-            </p>
-          </div>
+            <IncidentPanel
+              results={results}
+              status={status}
+              isSimulated={isSimulated}
+              onInspect={setSelectedProc}
+              onViewGraph={() => setActiveTab('Threat Graph')}
+            />
 
-          <div style={{ backgroundColor: '#1e293b', padding: '1.25rem', borderRadius: '0.5rem', border: '1px solid #334155' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', color: '#94a3b8' }}>
-              <span>System Status</span>
-              <Server style={{ width: '20px', height: '20px' }} />
-            </div>
-            <p style={{ fontSize: '1.5rem', fontWeight: 'bold', margin: '0.75rem 0 0 0', color: telemetryData?.system_status === 'NORMAL' ? '#22c55e' : (telemetryData ? '#ef4444' : '#f8fafc') }}>
-              {telemetryData ? telemetryData.system_status : 'READY'}
-            </p>
-          </div>
-        </div>
+            <div className="split">
+              <div className="card card-pad" style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+                <div className="toolbar">
+                  <input
+                    className="input"
+                    type="text"
+                    placeholder="Search by PID or name"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                  />
+                  <div className="chips">
+                    {['ALL', 'HIGH', 'NETWORK'].map((chip) => (
+                      <button key={chip} onClick={() => setFilter(chip)} className={`chip ${filter === chip ? 'on' : ''}`}>
+                        {chip}
+                      </button>
+                    ))}
+                  </div>
+                </div>
 
-        {/* View Selection Tabs */}
-        <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1rem' }}>
-          <button 
-            onClick={() => setActiveTab('table')}
-            style={{
-              backgroundColor: activeTab === 'table' ? '#0284c7' : '#1e293b',
-              color: '#ffffff', border: '1px solid #334155', padding: '0.5rem 1rem',
-              borderRadius: '0.375rem', cursor: 'pointer', fontSize: '0.875rem', fontWeight: '600'
-            }}>
-            Process Table
-          </button>
-          <button 
-            onClick={() => setActiveTab('graph')}
-            style={{
-              backgroundColor: activeTab === 'graph' ? '#0284c7' : '#1e293b',
-              color: '#ffffff', border: '1px solid #334155', padding: '0.5rem 1rem',
-              borderRadius: '0.375rem', cursor: 'pointer', fontSize: '0.875rem', fontWeight: '600', display: 'flex', alignItems: 'center', gap: '0.4rem'
-            }}>
-            <Network style={{ width: '16px', height: '16px' }} /> Visual Chain Graph
-          </button>
-        </div>
+                <div className="table-wrap">
+                  <table className="table">
+                    <thead>
+                      <tr><th>PID</th><th>Process</th><th>Risk</th><th></th></tr>
+                    </thead>
+                    <tbody>
+                      {filteredResults.length === 0 && (
+                        <tr><td colSpan={4} className="muted">No processes match. Clear the search or filter.</td></tr>
+                      )}
+                      {filteredResults.map((proc) => (
+                        <tr key={`${proc.pid}-${proc.create_time}`} style={{ opacity: proc.is_isolated ? 0.5 : 1 }}>
+                          <td className="mono muted">{proc.pid}</td>
+                          <td style={{ color: '#fff', fontWeight: 600 }}>
+                            {proc.name} {proc.is_isolated && <span className="muted" style={{ fontWeight: 400 }}>· isolated</span>}
+                          </td>
+                          <td><Pill level={proc.threat_level}>{proc.risk_score}</Pill></td>
+                          <td><button className="btn btn-ghost" onClick={() => setSelectedProc(proc)}>Inspect</button></td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
 
-        {/* Tab Content Display */}
-        {activeTab === 'graph' ? (
-          <GraphProcessing isSimulated={isSimulated} />
-        ) : (
-          <div style={{ backgroundColor: '#1e293b', borderRadius: '0.5rem', border: '1px solid #334155', padding: '1.5rem' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-              <h2 style={{ fontSize: '1.1rem', fontWeight: '600', margin: 0, color: '#cbd5e1' }}>Telemetry Process Analysis</h2>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', backgroundColor: '#0f172a', border: '1px solid #334155', padding: '0.4rem 0.75rem', borderRadius: '0.375rem' }}>
-                <Search style={{ width: '16px', height: '16px', color: '#64748b' }} />
-                <input 
-                  type="text" 
-                  placeholder="Search process name or PID..." 
-                  value={searchTerm}
-                  onChange={(e) => setSearchTerm(e.target.value)}
-                  style={{ background: 'transparent', border: 'none', color: '#f8fafc', outline: 'none', fontSize: '0.875rem', width: '200px' }}
-                />
+              <div className="card" style={{ overflow: 'hidden' }}>
+                <GraphProcessing isSimulated={isSimulated} refreshKey={refreshKey} onNodeClick={setSelectedProc} />
               </div>
             </div>
+          </div>
+        )}
 
-            <div style={{ overflowX: 'auto' }}>
-              <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.875rem' }}>
-                <thead>
-                  <tr style={{ borderBottom: '1px solid #334155', color: '#94a3b8' }}>
-                    <th style={{ padding: '0.75rem' }}>PID</th>
-                    <th style={{ padding: '0.75rem' }}>Process Name</th>
-                    <th style={{ padding: '0.75rem' }}>User</th>
-                    <th style={{ padding: '0.75rem' }}>Threat Level</th>
-                    <th style={{ padding: '0.75rem' }}>Risk Score</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {filteredProcesses.length > 0 ? (
-                    filteredProcesses.slice(0, 15).map((proc) => (
-                      <tr key={proc.pid} style={{ borderBottom: '1px solid #1e293b' }}>
-                        <td style={{ padding: '0.75rem', fontFamily: 'monospace', color: '#38bdf8' }}>{proc.pid}</td>
-                        <td style={{ padding: '0.75rem', fontWeight: '500' }}>{proc.name}</td>
-                        <td style={{ padding: '0.75rem', color: '#94a3b8' }}>{proc.username || 'SYSTEM'}</td>
-                        <td style={{ padding: '0.75rem' }}>
-                          <span style={{ 
-                            padding: '0.2rem 0.5rem', borderRadius: '0.25rem', fontSize: '0.75rem', fontWeight: 'bold',
-                            backgroundColor: proc.threat_level === 'HIGH' ? '#450a0a' : (proc.threat_level === 'MEDIUM' ? '#451a03' : '#064e3b'),
-                            color: proc.threat_level === 'HIGH' ? '#fca5a5' : (proc.threat_level === 'MEDIUM' ? '#fdba74' : '#6ee7b7')
-                          }}>
-                            {proc.threat_level}
-                          </span>
-                        </td>
-                        <td style={{ padding: '0.75rem', fontWeight: 'bold' }}>{proc.risk_score} / 100</td>
-                      </tr>
-                    ))
-                  ) : (
-                    <tr>
-                      <td colSpan="5" style={{ padding: '2rem', textAlign: 'center', color: '#64748b' }}>
-                        {telemetryData ? 'No matching processes found.' : 'Click "Run Live Diagnostics" to fetch live system processes.'}
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
+        {/* THREAT GRAPH */}
+        {activeTab === 'Threat Graph' && (
+          <div style={{ flex: 1, padding: 16, minHeight: 0 }}>
+            <div className="card" style={{ height: '100%', overflow: 'hidden' }}>
+              <GraphProcessing isSimulated={isSimulated} refreshKey={refreshKey} onNodeClick={setSelectedProc} />
+            </div>
+          </div>
+        )}
+
+        {/* PROCESS ANALYTICS */}
+        {activeTab === 'Process Analytics' && (
+          <div className="page">
+            <h3 className="card-title">Processes ranked by risk score</h3>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 16 }}>
+              {sortedResults.slice(0, 10).map((proc) => (
+                <div
+                  key={`${proc.pid}-${proc.create_time}`}
+                  className="card card-pad"
+                  style={{ cursor: 'pointer' }}
+                  onClick={() => setSelectedProc(proc)}
+                >
+                  <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+                    <strong style={{ color: '#fff' }}>{proc.name} <span className="muted mono">PID {proc.pid}</span></strong>
+                    <Pill level={proc.threat_level}>{proc.risk_score}</Pill>
+                  </div>
+                  <div className="muted mono" style={{ fontSize: '0.75rem', marginTop: 6, wordBreak: 'break-all' }}>{proc.exe}</div>
+                  <div className="mono" style={{ fontSize: '0.75rem', marginTop: 4, color: 'var(--accent)', wordBreak: 'break-all' }}>
+                    {proc.cmdline?.join(' ') || 'N/A'}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* RULE ENGINE */}
+        {activeTab === 'Rule Engine' && (
+          <div className="page">
+            <h3 className="card-title">Detection rules</h3>
+            <div className="stack">
+              {rules.length === 0 && <div className="muted">No rules loaded. Check that the backend is running.</div>}
+              {rules.map((r) => (
+                <div className="row" key={r.id}>
+                  <div>
+                    <div style={{ color: '#fff', fontWeight: 600 }}>
+                      <span className="mono muted">{r.id}</span> {r.name}
+                    </div>
+                    <div className="muted" style={{ fontSize: '0.75rem' }}>MITRE ATT&CK {r.mitre}</div>
+                  </div>
+                  <span className="mono" style={{ color: 'var(--pink)', fontWeight: 700 }}>{r.points} pts</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* ALERT LOGS */}
+        {activeTab === 'Alert Logs' && (
+          <div className="page">
+            <h3 className="card-title">Security events</h3>
+            <div className="stack">
+              {alertList.length === 0 && (
+                <div className="muted">No alerts. Press Simulate Attack to see how a chain is detected.</div>
+              )}
+              {alertList.map((proc) => (
+                <div
+                  key={`${proc.pid}-${proc.create_time}`}
+                  className="row"
+                  style={{ cursor: 'pointer', opacity: proc.is_isolated ? 0.5 : 1 }}
+                  onClick={() => setSelectedProc(proc)}
+                >
+                  <div>
+                    <div style={{ color: '#fff', fontWeight: 600 }}>
+                      {proc.name} <span className="muted mono">PID {proc.pid}</span>
+                    </div>
+                    <div className="muted" style={{ fontSize: '0.78rem', marginTop: 2 }}>{proc.human_summary}</div>
+                  </div>
+                  <Pill level={proc.threat_level}>{proc.risk_score}</Pill>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* SETTINGS */}
+        {activeTab === 'Settings' && (
+          <div className="page">
+            <h3 className="card-title">Settings</h3>
+            <div className="card card-pad" style={{ maxWidth: 440 }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer' }}>
+                <input type="checkbox" checked={autoRefresh} onChange={(e) => setAutoRefresh(e.target.checked)} />
+                Auto-refresh the live scan every 3 seconds
+              </label>
+              <div className="muted" style={{ fontSize: '0.75rem', marginTop: 8 }}>
+                Applies to the live system only. Simulation mode does not refresh on its own.
+              </div>
             </div>
           </div>
         )}
       </main>
+
+      <DetailModal process={selectedProc} onClose={() => setSelectedProc(null)} onIsolate={isolateProc} />
+
+      {toast && <div className="toast">{toast}</div>}
     </div>
   );
 }

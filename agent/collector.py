@@ -46,4 +46,4 @@ class TelemetryCollector:
 if __name__ == "__main__":
     collector = TelemetryCollector()
     snapshot = collector.capture_system_snapshot()
-    print(f"[+] Successfully captured activity logs for {len(snapshot)} running programs.")
+    print(f"[+] {len(snapshot)} Logs of running programs captured successfully ")
